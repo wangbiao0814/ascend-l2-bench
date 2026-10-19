@@ -49,9 +49,9 @@ def parser():
     p.add_argument('--evict-mib', type=int, default=0,
                    help='best-effort L2 eviction read sweep before each timed launch')
     p.add_argument('--library', type=Path,
-                   default=ROOT/'python/ascend_kernel/ascend_kernel/lib/libascend_kernel.so')
+                   default=ROOT/'output/libl2_bench.so')
     p.add_argument('--csv', type=Path, default=ROOT/'results.csv')
-    p.add_argument('--dry-run', action='store_true', help='print plans without torch/NPU')
+    p.add_argument('--dry-run', action='store_true', help='print plans without CANN/NPU')
     p.add_argument('--profile-only', action='store_true',
                    help='one case, one custom kernel launch; no warmup/check/timing')
     return p
@@ -75,85 +75,63 @@ def main():
         print(json.dumps(cases, indent=2))
         return
 
-    import torch
-    import torch_npu  # registers NPU backend
-    if not torch.npu.is_available():
-        raise RuntimeError('Ascend NPU is required')
-    torch.npu.set_device(a.device)
-    torch.ops.load_library(str(a.library.resolve()))
-    op = torch.ops.npu.l2_load_bench
-    device = f'npu:{a.device}'
-    meta = dict(torch=torch.__version__, torch_npu=getattr(torch_npu, '__version__', ''),
-                device=torch.npu.get_device_name(a.device), requested_cores=a.cores,
-                timing='NPU event around one launch', evict_mib=a.evict_mib,
-                note='GB/s is logical bytes / elapsed seconds / 1e9, not measured HBM traffic',
-                arguments={k: str(v) if isinstance(v, Path) else v for k, v in vars(a).items()})
-    a.csv.parent.mkdir(parents=True, exist_ok=True)
-    a.csv.with_suffix('.meta.json').write_text(json.dumps(meta, indent=2))
-    print(json.dumps(meta, ensure_ascii=False))
+    from acl_backend import Backend
+    with Backend(a.library, a.device) as backend:
+        meta = dict(device_id=a.device, available_aiv_cores=backend.cores,
+                    ub_bytes=backend.ub_bytes, requested_cores=a.cores,
+                    timing='ACL NPU events around one launch', evict_mib=a.evict_mib,
+                    note='GB/s is logical bytes / elapsed seconds / 1e9, not measured HBM traffic',
+                    arguments={k: str(v) if isinstance(v, Path) else v for k, v in vars(a).items()})
+        a.csv.parent.mkdir(parents=True, exist_ok=True)
+        a.csv.with_suffix('.meta.json').write_text(json.dumps(meta, indent=2))
+        print(json.dumps(meta, ensure_ascii=False))
 
-    ex = ey = None
-    if a.evict_mib and not a.profile_only:
-        e = plan(a.evict_mib, a.tile_kib, 1, 0, 1)
-        ex = torch.randn(e['input_bytes'] // 4, device=device)
-        ey = torch.empty_like(ex)
+        eviction = None
+        if a.evict_mib and not a.profile_only:
+            eviction_case = plan(a.evict_mib, a.tile_kib, 1, 0, 1)
+            eviction = backend.allocate(eviction_case['input_bytes'], seed=17)
 
-    def launch(x, y, case):
-        op(x, y, case['repeats'], case['tile_elements'], case['group_tiles'],
-           case['cache'], a.cores)
-
-    rows = []
-    # Allocate each size once; all strategies at that size use the same x and y.
-    for size in a.sizes_mib:
-        subset = [c for c in cases if c['requested_mib'] == size]
-        n = subset[0]['input_bytes'] // 4
-        x = torch.randn(n, dtype=torch.float32, device=device)
-        y = torch.empty_like(x)
-        torch.npu.synchronize()
-        random.Random(2026 + size).shuffle(subset)
-        for case in subset:
-            if a.profile_only:
-                launch(x, y, case)
-                torch.npu.synchronize()
-                print('Profile target:', json.dumps(case))
-                return
-            # Sample correctness before warmup, outside all timed regions.
-            launch(x, y, case)
-            torch.npu.synchronize()
-            idx = torch.linspace(0, n - 1, min(n, 4096), device=device).long()
-            torch.testing.assert_close(y[idx].cpu(), (x[idx] + 1).cpu(), rtol=1e-6, atol=1e-6)
-            del idx
-            for _ in range(a.warmup):
-                launch(x, y, case)
-            torch.npu.synchronize()
-            times = []
-            for _ in range(a.trials):
-                if ex is not None:
-                    # Read a disjoint region through L2. This is not a hardware flush.
-                    op(ex, ey, 1, a.tile_kib * 256, 0, 1, a.cores)
-                    torch.npu.synchronize()
-                start = torch.npu.Event(enable_timing=True)
-                end = torch.npu.Event(enable_timing=True)
-                start.record()
-                launch(x, y, case)
-                end.record()
-                end.synchronize()
-                times.append(start.elapsed_time(end))
-            median = statistics.median(times)
-            row = dict(case, cores_requested=a.cores, median_ms=median,
-                       min_ms=min(times), max_ms=max(times),
-                       read_effective_GBs=case['logical_read_bytes'] / (median * 1e6),
-                       rw_effective_GBs=(case['logical_read_bytes'] + case['logical_write_bytes']) / (median * 1e6))
-            rows.append(row)
-            label = 'scan' if case['group_tiles'] == 0 else f"group={case['group_tiles']}"
-            print(f"{case['input_bytes']/MIB:7.1f} MiB {label:12s} L2={case['cache']} "
-                  f"{median:9.3f} ms  read-effective={row['read_effective_GBs']:8.1f} GB/s "
-                  f"rw-effective={row['rw_effective_GBs']:8.1f} GB/s")
-            with a.csv.open('w', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=list(rows[0]))
-                writer.writeheader()
-                writer.writerows(rows)
-        del x, y
+        rows = []
+        # Allocate each size once; all strategies use identical input/output addresses.
+        for size in a.sizes_mib:
+            subset = [c for c in cases if c['requested_mib'] == size]
+            buffer = backend.allocate(subset[0]['input_bytes'])
+            random.Random(2026 + size).shuffle(subset)
+            for case in subset:
+                if a.profile_only:
+                    backend.launch(buffer, case, a.cores)
+                    print('Profile target:', json.dumps(case))
+                    return
+                # Poison output so a missing write cannot pass using a previous result.
+                backend.poison(buffer)
+                backend.launch(buffer, case, a.cores)
+                backend.verify(buffer)
+                for _ in range(a.warmup):
+                    backend.launch(buffer, case, a.cores)
+                times = []
+                for _ in range(a.trials):
+                    if eviction is not None:
+                        backend.launch(eviction, eviction_case, a.cores)
+                    elapsed = backend.launch(buffer, case, a.cores, timed=True)
+                    if not math.isfinite(elapsed) or elapsed <= 0:
+                        raise RuntimeError('invalid ACL event duration; use a larger input/repeat count')
+                    times.append(elapsed)
+                median = statistics.median(times)
+                row = dict(case, cores_requested=a.cores,
+                           cores_used=min(a.cores or backend.cores, case['tiles']), median_ms=median,
+                           min_ms=min(times), max_ms=max(times),
+                           read_effective_GBs=case['logical_read_bytes'] / (median * 1e6),
+                           rw_effective_GBs=(case['logical_read_bytes'] + case['logical_write_bytes']) / (median * 1e6))
+                rows.append(row)
+                label = 'scan' if case['group_tiles'] == 0 else f"group={case['group_tiles']}"
+                print(f"{case['input_bytes']/MIB:7.1f} MiB {label:12s} L2={case['cache']} "
+                      f"{median:9.3f} ms  read-effective={row['read_effective_GBs']:8.1f} GB/s "
+                      f"rw-effective={row['rw_effective_GBs']:8.1f} GB/s")
+                with a.csv.open('w', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+                    writer.writeheader()
+                    writer.writerows(rows)
+            backend.release(buffer)
     print(f'Results: {a.csv.resolve()}')
 
 

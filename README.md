@@ -1,8 +1,9 @@
 # Ascend C：L2 重用距离与带宽对照实验
 
-工程状态：已生成完整 Ascend C kernel、PyTorch 注册、构建脚本、计时脚本与精度测试。
+工程状态：独立 Ascend C kernel + ACL Host，提供构建脚本、计时脚本与精度测试。
+构建和运行均不依赖 PyTorch、torch_npu、pybind11 或任何第三方 Python 包。
 本地为 Mac，没有 CANN/NPU；**尚未完成目标设备编译和上板实测，没有预填性能数据**。
-面向支持 `SetL2CacheHint` 的 Atlas A2/A3，优先在 910B 上验证。
+面向支持 `SetL2CacheHint` 的 Atlas A2/A3；当前目标为 910C、CANN 9.0.0。
 其他产品及不同 CANN 版本需确认接口、编译目标和 profiling 支持情况。
 
 ## 实验做了什么
@@ -29,27 +30,29 @@
 
 ## 构建与运行
 
-在有昇腾 NPU 的 Linux 主机上，使用与驱动/CANN 匹配的 Python、PyTorch、torch_npu。
-构建需要 CMake >= 3.20、CANN 开发工具、pybind11、setuptools 和 wheel。
-本工程从技能提供的 ascend-kernel 模板派生，只保留此测试算子。
+在有昇腾 NPU 的 Linux 主机上，加载与驱动配套的 CANN 开发环境。
+构建需要 CMake >= 3.20、C++17 编译器和 CANN 开发工具；运行脚本只需 Python 3 标准库。
+Host 直接调用 ACL，Python 通过 `ctypes` 调用 `output/libl2_bench.so`。
 
 ```bash
 cd ascend-l2-bench
-# 按你的实际环境加载 CANN set_env.sh，并激活已有的 Python 环境。
+# 按你的实际安装位置加载 CANN set_env.sh。
 # 确认 ASCEND_HOME_PATH 已设置。
-# 使用该设备实际、且被当前 CANN 支持的 SoC 编译标识，不能只填营销型号 910B。
-bash build.sh "$SOC_VERSION"
+# 910C/A3 先查询：npu-smi info -t board -i 0 -c 0
+# 按实际输出拼接 Chip Name_NPU Name；例如输出 Ascend910 和 9391 时：
+bash build.sh Ascend910_9391
 
-# 不用安装 wheel，直接加载当前工程编译出的 .so。
+# 直接加载编译出的 output/libl2_bench.so。
 python3 -m unittest discover -s tests -p test_npu.py -v
 python3 bench.py
 ```
 
-`SOC_VERSION` 必须由使用者按目标设备设置，例如某些设备对应 `Ascend910B1`；
-不要在不确认型号时直接照抄。切换 SoC/CANN 时使用新的构建目录或先移走旧 build 目录。
-`build.sh` 不会搜索或猜测 CANN 路径，也不会自动安装依赖。
-构建完成会生成 `output/*.whl`，可选安装；计时脚本默认直接加载本工程 .so。
-若通过其他途径编译，使用 `--library /absolute/path/to/libascend_kernel.so`。
+`build.sh` 的第一个参数是完整 SoC 编译标识（传给 CMake 的 `SOC_VERSION`）。
+上面的型号只是查询结果示例，请以本机输出为准。
+构建目录为 `build-acl/`，与旧构建目录隔离；切换 SoC/CANN 时先移走 `build-acl/`。
+`build.sh` 使用已加载的 `ASCEND_HOME_PATH`，不安装依赖。
+构建产物为 `output/libl2_bench.so`，无需安装。
+若库位于其他位置，使用 `--library /absolute/path/to/libl2_bench.so`。
 
 建议先只跑一个 512 MiB 的四组顺序对照：
 
@@ -62,13 +65,14 @@ python3 bench.py --sizes-mib 512 --repeats 8 \
 自动使用可用 AIV 核；可用 `--cores` 固定参与核数。
 每个输入规模只分配一次 x/y，全部顺序使用同一份输入；以固定随机顺序运行各对照。
 较大的输入需要足够 NPU 内存，默认最大输入和输出合计约 1 GiB。
-脚本使用 FP32 连续 ND Tensor；若手工调用，请避免带有私有格式的 Tensor。
+输入和输出是分别分配的 FP32 连续设备缓冲区，由 ACL 管理。
 
 ## 怎样读结果
 
-每种配置做一次计时外的采样正确性检查、预热，再重复计时；
+输入在 CPU 上由固定种子的确定性函数生成，再通过 ACL 拷入设备。
+每种配置先把输出填为 NaN，再做一次计时外的采样正确性检查、预热及重复计时；
 独立的 `test_npu.py` 会对小规模案例做全输出检查。
-CSV 保存中位数、最短/最长耗时和逻辑字节数，旁边的 meta.json 保存环境与参数。
+CSV 保存中位数、最短/最长耗时、实际核数和逻辑字节数，旁边的 meta.json 保存设备编号、AIV 核数、UB 容量与参数。
 结果由本机运行产生，本工程没有提供模拟的性能数字。
 
 设 N 为实际输入字节数，R 为重复次数，t 为算子耗时（秒）：
@@ -87,7 +91,7 @@ CSV 保存中位数、最短/最长耗时和逻辑字节数，旁边的 meta.jso
 在简化的读写共用 HBM 带宽模型中，R=8 时，即使读侧理想复用，
 总 HBM 流量也只是从 16N 降到约 9N；不能预期整个算子快 8 倍。
 
-NPU Event 包围一次启动，短 kernel 的结果可能混入主机提交空隙。
+ACL NPU Event 包围一次启动，短 kernel 的结果可能混入主机提交空隙。
 优先使用足够大的 N/R，并用 profiler 的 kernel duration 复核。
 这些队列使用双缓冲，但本实验没有声称达到硬件极限带宽。
 
@@ -125,7 +129,7 @@ msprof op --aic-metrics=L2Cache,Memory \
     --application="python3 bench.py --sizes-mib 512 --repeats 8 --groups 1 --cache off --profile-only"
 ```
 
-torch 初始化、随机数生成也会产生 kernel，必须只筛选 `l2_load_bench`。
+profiling 时只筛选 `l2_load_bench`，不要把初始化、内存传输等任务算入目标耗时。
 查看 L2Cache 和 Memory 报告，结合目标 kernel duration 比较。
 如工具支持分开的读/写命中率，优先读命中率；不要把聚合命中率直接当输入命中率。
 检查 MTE2/GM->UB 流量、HBM/main-memory read 与 write 流量的区别。
@@ -146,10 +150,11 @@ python3 bench.py --dry-run --sizes-mib 512 --groups 1 0
 ```
 
 - `csrc/ops/l2_load_bench/op_kernel/l2_load_bench.cpp`：GM/UB 搬运、计算与分组调度。
-- `csrc/ops/l2_load_bench/op_host/l2_load_bench.cpp`：参数校验、硬件查询与启动。
+- `csrc/ops/l2_load_bench/op_host/l2_load_bench.cpp`：ACL 初始化、内存管理、参数校验、硬件查询、启动、事件计时与正确性检查。
+- `acl_backend.py`：标准库 ctypes 封装。
 - `csrc/ops/l2_load_bench/design.md`：接口、UB 布局、工作量与实验边界。
 - `tests/test_schedule.py`：调度覆盖、每 tile 访问次数、写入核唯一性、字节统计。
-- `tests/test_npu.py`：目标设备全输出正确性检查与输入输出别名拒绝测试。
+- `tests/test_npu.py`：目标设备全输出正确性、参数校验、输出 NaN 检测与事件计时检查。
 
 ## 官方依据
 
@@ -157,3 +162,5 @@ python3 bench.py --dry-run --sizes-mib 512 --groups 1 0
 - [SetL2CacheHint](https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/82RC1alpha001/API/ascendcopapi/atlasascendc_api_07_00033.html)
 - [msprof op 采集接口](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850alpha001/devaids/optool/atlasopdev_16_0090.html)
 - [Ascend/msopprof 用户指南与 cache 清理行为](https://github.com/Ascend/msopprof/blob/master/docs/zh/user_guide/msopprof_user_guide.md)
+- [A3 SoC 编译型号查询](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/900/devaids/atctool/atlasatcparam_16_0036.html)
+- [ACL 事件计时示例](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/900/programug/acldevg/runtime_doc_dev_0023.html)

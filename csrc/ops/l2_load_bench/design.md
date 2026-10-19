@@ -2,16 +2,26 @@
 
 ## 1. 接口与语义
 
-```cpp
-void l2_load_bench(const at::Tensor& x, at::Tensor out,
-    int64_t repeats, int64_t tile_elements, int64_t group_tiles,
-    int64_t cache, int64_t cores);
+Host 通过 `csrc/ops.h` 中的 C ABI 管理一个 ACL session 和独立输入/输出缓冲：
+
+```text
+l2_open -> l2_alloc -> l2_poison -> l2_run -> l2_verify -> l2_free -> l2_close
 ```
 
-FP32、连续 ND、NPU 上的独立输入/输出，元素数量相等且为 tile_elements 整数倍。
-没有对应的 PyTorch 同名算子；参考表达式为 `out = x + 1`。
+`l2_run` 接收 repeats、tile_elements、group_tiles、cache、cores 和 timed。
+FP32、元素数量为 tile_elements 整数倍，输入与输出分别分配，不提供外部指针别名入口。
+参考表达式为 `out = x + 1`。
 每个元素重复执行 R 次相同表达式，每次均重新加载原始 x 并写 out，
 不是 `out += 1`，最终 out 始终为 x+1。无需 workspace。
+
+Session 使用 ACL stream 和带 `ACL_EVENT_TIME_LINE` 标志的起止事件；
+计时包围一次 kernel 启动，随后同步 stream 并读取 elapsed time（毫秒）。
+每次启动后同步，初始化、传输、验证与可选驱逐不计入目标耗时。
+输入按索引和 seed 生成可精确表示的 FP32 值，以相同函数执行 CPU 验证。
+默认校验四个窗口（最多 4096 个元素），测试使用 full 模式检查所有输出。
+校验前用 NaN 覆盖输出，避免前一次结果掩盖漏写。
+C ABI 捕获异常并返回错误文本；Python ctypes 封装负责释放缓冲及 session。
+每个进程同一时刻只打开一个 session，所有调用在创建 session 的线程执行。
 
 ## 2. 两级切分与计算
 
@@ -47,7 +57,7 @@ bufferCoefficient=16，默认 tile_elements=4096（16 KiB 输入 tile），
 队列分配总计 64 KiB。Host 查询 UB 容量并留 8 KiB 余量，不硬编码容量和核数。
 限定 tile_elements 为 128 元素（512 字节）的倍数，范围 [128,16384]。
 不支持尾 tile；测试端向上取整总元素数并报告实际字节数。
-FP32 不需要 Cast。所有 EXEC_KERNEL_CMD 参数使用左值。
+FP32 不需要 Cast。Host 通过生成的 ACLRT_LAUNCH_KERNEL 入口直接启动 kernel。
 标量 tiling 参数由直调 kernel 参数传入，无额外 tiling GM Buffer。
 
 ## 4. 对照设计
@@ -65,7 +75,7 @@ G=1 是立即重复读取，G 增大拉长重用距离，G=0 是分片完整扫�
 
 ## 5. 检查清单
 
-- 已更新 ops.h、register.cpp、csrc/CMakeLists.txt。
+- 已更新 ops.h、ACL Host、ctypes 封装与 CMake；已删除框架注册与 wheel 打包。
 - 已提供 CPU 调度覆盖/归属/次数验证及 NPU 全输出精度测试。
 - 已提供事件计时、CSV 和单次 profiler 入口。
 - Mac 本地没有 CANN/NPU，尚未编译和上板验证。
