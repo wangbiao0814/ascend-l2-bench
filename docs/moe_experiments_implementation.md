@@ -577,7 +577,190 @@ PY
 
 这组日志只覆盖 E0，不能代替 E1 的提前加载收益或 E3 的 KV 并发干扰结论。
 
-## 12. 源码入口与验证范围
+## 12. 每个实验的输出应该怎样分析
+
+本节先说明真实输出结构，再逐实验说明比较关系。E0 使用你提供的真实日志；E1/E2/E3 的数字均是**解释用的假设示例，不是设备测量结果**。当前仓库没有这三组的实测结果，不能据此认定它们的瓶颈已经存在。
+
+### 12.1 先读懂一行输出
+
+你提供的真实日志第一行之一为：
+
+```text
+e0 16 MiB interference trial=00 target=10.280 us total=100.220 us
+```
+
+它表示：A=16 MiB，采用 A1→D→A2，正式 trial 编号 0；A2 的 event 包络为 10.280 μs，整图从公共起点到结束为 100.220 μs。D 的大小需结合参数或 meta.json，这行没有打印。
+
+`total − target = 89.940 μs` 不是 D 的耗时，它还包含 A1、其他事件间隙及图的等待。要知道 D 或 A1 的耗时，必须读 stages.jsonl。也不能把这里的 target 理解成三阶段时间总和。
+
+| 实验/variant | 控制台 target 的对象 | total 覆盖范围 |
+|---|---|---|
+| E0 全部 | A2 | A1、可选 D/gap、A2 以及图内间隙 |
+| E2 全部 | A2 | 含所有图节点；clustered 的 B/C 也包括在内 |
+| E1 全部 | G1 | C0、可选 P1、G1，等待两条 stream 完成 |
+| E3 alone/并发对照 | F | F 和背景 K，若有 K 则等待它完成 |
+| E3 background_only_large/random | K | 仅背景 K 及图启动/join 开销 |
+
+分析顺序建议为：确认参数和正确性 → 看目标 p50/p95 → 看逐 trial 配对差值 → 看整图与其他阶段是否付出代价 → 最后用设备时间线/计数器解释原因。
+
+### 12.2 summary.json 会自动给出哪些比较
+
+`summary.json` 顶层是参数组合列表。每项用 experiment、weight_bytes、interference_bytes、kv_chunk_bytes、cache_policy 标识，内部包括 variants 和 paired_comparisons。
+
+| 实验 | 自动比较 first−second | 指标 |
+|---|---|---|
+| E0 | interference−immediate | target_us |
+| E1 | demand−overlap_prefetch | makespan_us |
+| E1 | serial_prefetch−overlap_prefetch | makespan_us |
+| E2 | interleaved−clustered | target_us、makespan_us，分别输出 |
+| E3 | small_random−alone | target_us |
+| E3 | small_random−small_indexed_linear | target_us |
+| E3 | small_random−limited_cores | target_us |
+| E3 | small_random−limited_window | target_us |
+| E3 | small_random−limited_random | target_us |
+
+正数表示 first 更慢。比如 small_random−limited_cores 为正，说明限制背景核数后，前景 F 变快；它没有说明背景 K 或整图也变快。
+
+`variants` 自动保存 target_p50_us、target_p95_us、makespan_p50_us、trials、correctness_passed。当前没有自动保存 makespan p95、逐阶段 p50 或 E0 interference−time_gap；这些要从 trials.csv / stages.jsonl 计算。
+
+若用了 `--variants`，只有两边都存在的配对才会输出。少一个 variant 导致比较缺失，不代表差值为零。
+
+### 12.3 E0：你这次实测的详细解读
+
+下面从你粘贴的 270 行控制台记录重新计算，单位全部为 μs。每个大小、每个 variant 各 30 次。原日志已将时间打印到小数点后三位，因此重算统计可能与原始结果文件有极小舍入差异。
+
+| A 大小 | variant | A2 p50 | A2 p95 | 整图 p50 |
+|---|---|---:|---:|---:|
+| 16 MiB | immediate | 12.450 | 22.421 | 50.990 |
+| 16 MiB | interference | 10.310 | 10.491 | 102.930 |
+| 16 MiB | time_gap | 10.430 | 10.646 | 76.250 |
+| 42 MiB | immediate | 16.660 | 17.002 | 64.280 |
+| 42 MiB | interference | 16.830 | 17.117 | 118.960 |
+| 42 MiB | time_gap | 16.730 | 17.064 | 96.540 |
+| 84 MiB | immediate | 25.550 | 25.973 | 116.740 |
+| 84 MiB | interference | 25.740 | 26.039 | 167.370 |
+| 84 MiB | time_gap | 25.720 | 26.151 | 140.970 |
+
+按照代码的配对中位数与 bootstrap 方法，进一步得到：
+
+| A 大小 | 配对比较：A2 first−second | 配对差值中位数 | bootstrap 95% CI |
+|---|---|---:|---|
+| 16 MiB | interference−immediate | −2.070 | [−4.471, −0.420] |
+| 16 MiB | interference−time_gap | −0.090 | [−0.220, −0.020] |
+| 42 MiB | interference−immediate | +0.150 | [+0.050, +0.260] |
+| 42 MiB | interference−time_gap | +0.130 | [−0.040, +0.230] |
+| 84 MiB | interference−immediate | +0.120 | [+0.020, +0.260] |
+| 84 MiB | interference−time_gap | −0.080 | [−0.160, +0.090] |
+
+这里的第二类比较是为本文额外计算的，当前程序默认 summary 只包含第一类。
+
+**16 MiB：立即复用组存在明显波动。** immediate 的 p95 达到 22.421 μs，远高于两个插入间隔的组。不能解释为“插入 D 改善了缓存”，因为计算间隔组也接近 10.4 μs。更合理的下一步是检查 A1/A2 的事件间隙和设备时间线，确认是否有提交节奏、调度或其他状态变化；仅凭控制台无法定位原因。
+
+**42/84 MiB：有很小的正差值，但缺少访存特异性。** interference−immediate 的 CI 没有跨 0，说明该次采样中存在小的方向性差异；配对中位数只有 0.150/0.120 μs，约为 immediate p50 的 0.9%/0.5%。而 interference−time_gap 的 CI 均跨 0，没有把“访存干扰”与“插入时间间隔”清楚区分开。
+
+所以不能将结果简单写成“完全无差异”，也不能写成“证明专家被淘汰后重新加载”。更准确的表述是：**该次运行中，42/84 MiB 的访存间隔组相对立即复用存在亚微秒的小幅惩罚，但与计算间隔对照尚未区分出明确的访存特异性；未观察到显著的大额重载代价。**
+
+整图方面，interference 比 immediate 的 p50 分别多约 51.94、54.68、50.63 μs。这些是整图中位数之差，包含新增 D 的读取，不能当成 A2 的重载时间，也不是 summary 的配对中位数。
+
+下一次 E0 分析应补齐：实际 D/gap 阶段时间、gap_calibration_matched、A1 与 A2、各 trial 的差值以及多次独立运行。即使 CI 不跨 0，也要区分差异是否足够大、是否稳定、是否能归因于所研究的因素。
+
+### 12.4 E1：提前加载是否真的有净收益
+
+以下是假设示例，单位 μs；三组使用相同 P1 核数、相同矩阵和起始前缀。
+
+| variant | G1 target p50 | 整图 p50 |
+|---|---:|---:|
+| demand | 70 | 180 |
+| serial_prefetch | 45 | 195 |
+| overlap_prefetch | 48 | 160 |
+
+可这样逐层解读：
+
+1. 串行预读使 G1 从 70 降到 45，但整图从 180 增至 195。G1 获益被预读及相关开销抵消，因此“G1 更快”不等于方案更快。
+2. overlap_prefetch 的整图降至 160，相比 demand 的中位数差为 20 μs，按汇总中位数计算约降低 11.1%；相比 serial_prefetch 少 35 μs。
+3. 上述是两组汇总中位数的算术比较；正式结论仍应看程序输出的逐 trial 配对差值与 CI。
+4. G1 在 overlap 下略慢于 serial 不一定否定方案，因为整体可能隐藏了 P1 的一部分成本。
+5. 要把收益归因于预读与计算重叠，还需验证系统时间线确实有 C0/P1 重叠，并检查 C0 是否被 P1 拖慢。
+
+| 实际输出模式 | 可以支持的解释 | 下一步 |
+|---|---|---|
+| G1 降低，整图也降低 | 当前参数下提前读取有净收益 | 验证重叠，扫计算窗口与核数 |
+| G1 降低，整图持平/增加 | 目标加速被额外工作抵消 | 看 P1 成本及 C0 干扰 |
+| G1 基本不变，整图增加 | 预读没有带来可见收益 | 检查是否原本已热、是否驻留到使用时 |
+| overlap 比 serial 快，但比 demand 慢 | 移动预读时机减少了部分成本，仍不值得引入 | 不应只与 serial 比 |
+| 增大 compute-repeats 后才出现收益 | 收益可能依赖可利用的计算窗口 | 同时检查更长间隔带来的缓存变化 |
+
+不能用 `C0_us + P1_us − makespan_us` 算硬件重叠时间：makespan 还包括 G1、图间隙和 join，且两个 stream 的局部 epoch 不可直接对齐。
+
+### 12.5 E2：A2 加速和整图加速要分开
+
+以下是假设示例，单位 μs；A=B=C=42 MiB，前两个图均读取 168 MiB。
+
+| variant | A2 target p50 | 整图 p50 |
+|---|---:|---:|
+| interleaved | 45 | 180 |
+| clustered | 18 | 153 |
+| compute_gap_control | 19 | 110 |
+
+interleaved 与 clustered 的 A2 相差 27 μs，整图也相差 27 μs；按整图中位数计算降幅为 15%。因为两图总工作量一致，这种模式支持“把同一 A 的两次访问靠近，对该合成轨迹有益”。
+
+compute_gap_control 的 A2 接近 clustered，说明在间隔确实匹配的前提下，时间推迟本身没有复现访存间隔组的大额惩罚。它只读取 2A，不包含 B/C，因此不能把其 110 μs 当成优于 clustered 的等工作量调度方案。
+
+还要考虑其他结果形态：
+
+| 实际输出模式 | 解读 |
+|---|---|
+| A2 降低且 makespan 降低 | 局部复用改善转化为整图收益 |
+| A2 降低但 makespan 不变 | 其他阶段/间隙抵消收益；检查 B/C、A1 和图间隙 |
+| A2 与 makespan 都接近 | 该参数下未见重排收益，不能反推所有规模都无收益 |
+| interleaved 和 compute_gap_control 的 A2 都慢 | 时间或调度因素也可能参与，不支持仅归因于 B/C 淘汰 |
+| clustered 整图增加 | 重排没有获得净收益，需查看其他阶段变化 |
+
+尤其不要在 clustered 的 A2 结束处截断 total，B/C 在其后仍属于图；当前程序已经将它们计入 makespan。
+
+### 12.6 E3：前景收益是否由背景退让换来
+
+以下为假设的汇总示例，单位 μs。K 阶段 p50 需从 stages 计算，程序 summary 不自动汇总该列。
+
+| variant | F target p50 | K 阶段 p50 | 整图 p50 |
+|---|---:|---:|---:|
+| alone | 20 | — | 30 |
+| large_linear | 22 | 80 | 95 |
+| small_indexed_linear | 30 | 180 | 195 |
+| small_random | 50 | 200 | 215 |
+| limited_cores | 28 | 500 | 515 |
+| limited_window | 35 | 260 | 275 |
+| limited_random | 24 | 700 | 715 |
+| index_control | 21 | 90 | 105 |
+
+逐项分析：
+
+- small_random 下 F 从 20 增至 50，按两组中位数算，前景延迟放大到 2.5 倍。说明背景工作伴随明显前景干扰，但原因尚未定位。
+- 同为小块 indexed，顺序背景时 F=30、随机时 F=50，提示地址顺序与干扰强度有关。需要确认并发覆盖情况接近，不能忽略背景持续时间差异。
+- large_linear 与 small_indexed_linear 同时改变块大小和索引路径，差异不能全部归为粒度。
+- limited_cores 让 F 从 50 降到 28，但 K 从 200 增至 500，整图也增大。这是以背景进度换前景延迟，是否值得取决于实际调度目标。
+- limited_window 让 F 降到 35，说明软件窗口与干扰相关；不能将它描述成硬件槽位预留成功。
+- limited_random 的 F 最接近 alone，但背景与整图最慢，因此不能仅按 F 排名宣称最佳整体性能。
+- index_control 下 F 接近 alone，提示移除 KV 载荷后干扰明显减弱；这支持进一步研究载荷请求，但仍无法区分带宽、缓存或请求资源。
+
+background_only_large/random 用于对照背景独立运行时的 K 延迟。它们的 target=K；不要将它们的 target 与 alone 的 target=F 相除。正确的背景放大比应是同一背景模式下 `并发 K 延迟 / 独立 K 延迟`。
+
+还需从阶段/设备时间线确认 F 与 K 的实际相遇关系：若 K 在 F 开始前已结束，本次 F 不构成持续并发干扰测试；若 K 延续很久但与 F 没有实际执行重叠，多 stream 图也不能证明硬件并发。
+
+正式报告应至少同时列出 F p50/p95、K 延迟、makespan、背景配置和并发验证状态。若要判断请求槽问题，需要再补充可用的硬件计数和匹配物理带宽的对照；当前输出最多支持“存在何种前景干扰及限流权衡”。
+
+### 12.7 报告结论时保留哪些证据
+
+| 实验 | 需要一起记录 | 可以形成的结论范围 |
+|---|---|---|
+| E0 | A2 配对差值/CI、D 与 gap 的实际耗时、A1 | 访存间隔是否带来超出时间间隔的延迟变化 |
+| E1 | demand 对比的整图差值/CI、C0/P1/G1、核数、系统时间线 | 预读是否有净收益，是否存在可用计算窗口 |
+| E2 | A2 和等工作量整图差值/CI、B/C 大小 | 合成轨迹下邻近复用是否有效 |
+| E3 | F 与 K 延迟、整图、chunk、核数/窗口、并发状态 | 背景访问方式的干扰与限制背景的代价 |
+
+这些证据分别支撑不同层次的判断：延迟变化、整图收益、执行重叠、硬件原因，不能仅凭第一层直接替代后面几层。
+
+## 13. 源码入口与验证范围
 
 | 文件 | 负责内容 |
 |---|---|

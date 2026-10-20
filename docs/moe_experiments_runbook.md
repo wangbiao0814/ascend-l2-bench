@@ -105,6 +105,8 @@ python3 moe_bench.py --experiment e3 --sizes-mib 28 42 \
 
 ## 输出文件
 
+逐实验的输出字段、对照关系、真实 E0 统计和 E1–E3 假设示例见 [实现详解第 12 节](moe_experiments_implementation.md#12-每个实验的输出应该怎样分析)。
+
 每次运行使用不同的 `--output` 目录；程序拒绝覆盖已存在的结果文件。
 
 | 文件 | 内容 |
