@@ -12,7 +12,7 @@
 读探针只写少量校验结果；每次调用只扫描一遍。E1 使用 CANN ACLNN Matmul，新增构建需要完整 CANN 开发环境。
 原有 `bench.py` 保留，下文描述仍针对原始 L2 顺序实验。
 
-完整命令、结果含义与验证边界见 [MoE 实验运行说明](docs/moe_experiments_runbook.md)，假设与对照设计见 [实验设计](docs/moe_memory_experiments.md)。
+完整命令、结果含义与验证边界见 [MoE 实验运行说明](docs/moe_experiments_runbook.md)，假设与对照设计见 [实验设计](docs/moe_memory_experiments.md)。 每组实验的代码执行流程、完整参数、48 核 tile 划分与具体实例见 [实现详解](docs/moe_experiments_implementation.md)。
 
 ```bash
 # 无需 NPU，先查看新增实验的任务图：

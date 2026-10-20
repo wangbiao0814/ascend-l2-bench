@@ -1,5 +1,7 @@
 # MoE 访存实验运行说明
 
+详细执行流程、参数默认值、48 核 tile 划分和逐实验实例见 [实现详解](moe_experiments_implementation.md)。
+
 ## 实现范围
 
 新增 `moe_bench.py`，使用现有 CANN/ACL 原生库，不依赖 torch 或额外 Python 包。原有 `bench.py` 和其 kernel 保持原义。
@@ -67,7 +69,7 @@ python3 moe_bench.py --experiment e1 --matrix-k 7168 --matrix-n 2048 \
 ```
 
 - `--compute-*` 定义 C0 矩阵形状；`--compute-repeats` 增大前序计算窗口。
-- `--kv-cores` 在 E1 中表示 P1 的预读核数；建议分别用 1、4、8、12 核。
+- `--kv-cores` 在 E1 中控制 overlap_prefetch 的 P1 核数；serial_prefetch 的 P1 使用 `--cores`。上例的 48/4 同时改变了预读核数与时机；要隔离调度差异，先将两者都设为 4，再同步扫描 1、4、8、12 核。
 - `--matrix-k/n` 和 `--tokens` 定义 G1；E1 不使用 `--sizes-mib` 决定权重大小。
 - `--math-type 1` 允许 CANN 对 FP32 输入使用降精度的 Cube 路径；保存于 meta.json，其他值需确认目标支持。
 - C0/G1 的 ACLNN executor 设为 repeatable，workspace 在计时前分配，复用资源只能在同一 stream 顺序调用，关闭 session 时显式销毁。
