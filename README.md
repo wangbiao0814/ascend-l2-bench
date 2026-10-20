@@ -6,6 +6,25 @@
 面向支持 `SetL2CacheHint` 的 Atlas A2/A3；当前目标为 910C、CANN 9.0.0。
 其他产品及不同 CANN 版本需确认接口、编译目标和 profiling 支持情况。
 
+## 新增 MoE 瓶颈实验
+
+新增入口 `moe_bench.py`，覆盖冷/热校准（e0）、跨调用专家复用（e2）、提前预读与 GEMM（e1）、KV 散读干扰（e3）。
+读探针只写少量校验结果；每次调用只扫描一遍。E1 使用 CANN ACLNN Matmul，新增构建需要完整 CANN 开发环境。
+原有 `bench.py` 保留，下文描述仍针对原始 L2 顺序实验。
+
+完整命令、结果含义与验证边界见 [MoE 实验运行说明](docs/moe_experiments_runbook.md)，假设与对照设计见 [实验设计](docs/moe_memory_experiments.md)。
+
+```bash
+# 无需 NPU，先查看新增实验的任务图：
+python3 moe_bench.py --experiment e0 --sizes-mib 16 --interference-mib 64 --dry-run
+# 使用原构建命令重新构建后，在 NPU 主机执行：
+python3 -m unittest discover -s tests -p test_probe_npu.py -v
+python3 moe_bench.py --experiment e0 --sizes-mib 16 42 84 \
+    --interference-mib 64 --cores 48 --trials 30 --output results-moe-e0
+```
+
+新增代码已通过本地 CPU 模拟测试；尚未在 CANN/910C 上编译和运行。事件包络重叠不会被自动标记为已验证的 kernel 并发，缺失的硬件计数器保持空白。
+
 ## 实验做了什么
 
 固定同一份 FP32 输入 x 和独立输出 y。每个元素均执行 R 次：
